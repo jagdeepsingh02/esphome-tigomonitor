@@ -75,6 +75,7 @@ tigo_monitor:
 | `reset_at_midnight` | Boolean | false | Reset daily totals at midnight |
 | `power_calibration` | Float | 1.0 | Power multiplier (0.5-2.0) |
 | `night_mode_timeout` | Integer | 60 | Minutes before night mode (1-1440) |
+| `panel_alerts` | Mapping | see [Per-panel alerts](#per-panel-alerts) | Thresholds for the per-panel `alert` sensors |
 | `week_start` | `monday` / `sunday` | `monday` | First day of the week for per-panel `energy_week` sensors |
 | `stale_timeout` | Integer | 10 | Minutes without data before a device's production values (power, current, efficiency, duty cycle) zero out. `0` disables. Voltage/temperature keep their last reading for diagnostics |
 | `history_interval` | Integer | 30 | Minutes between on-flash history snapshots (5–1440). Lower means finer charts but proportionally more flash wear and shorter retention — see [Saving History to Flash](/esphome-tigomonitor/guides/tsdb-integration/). Values under 15 log a warning at build time |
@@ -411,6 +412,54 @@ carries — see [Large installs](#large-installs--internal-ram). On a big array,
 enable only the periods you actually look at; Home Assistant's
 [utility meter](https://www.home-assistant.io/integrations/utility_meter/)
 can derive the others from lifetime `energy`.
+
+### Per-panel alerts
+
+Two optional sub-keys flag a panel that needs a look:
+
+```yaml
+sensor:
+  - platform: tigo_monitor
+    address: "04C05B4000899AA0"
+    name: "Panel 1"
+    alert:              # binary sensor, device class "problem"
+      filters:
+        - delayed_on: 10min   # optional: ignore a passing cloud
+    alert_reason: {}    # text: ok | stale | string_down | low | underperforming
+```
+
+The rules are the dashboard's **Alerts** list, so Home Assistant and the web
+UI agree on which panel is in trouble:
+
+| Reason | When |
+|---|---|
+| `stale` | The panel has stopped reporting for longer than `stale_timeout` |
+| `string_down` | Its whole string produces nothing while the rest of the site does |
+| `low` | Below 30 % of its string's median output |
+| `underperforming` | Below 60 % of its string's median output |
+| `ok` | None of the above |
+
+- A panel is compared with the other panels on its **string** (panels without
+  a string label: with all panels), so dawn, dusk and cloud move the reference
+  with it instead of raising alerts. Panels under 5 W don't count toward the
+  median, and a string whose median is below `min_string_power` isn't compared
+  at all.
+- Once flagged, a panel has to climb `hysteresis` above the threshold before
+  it clears, so it doesn't flap on the line.
+- Everything reads `ok` in night mode.
+- Time-based debouncing is up to you, with ESPHome's own binary-sensor
+  filters as above.
+
+Thresholds are optional; these are the defaults:
+
+```yaml
+tigo_monitor:
+  panel_alerts:
+    low_threshold: 30%
+    underperform_threshold: 60%
+    min_string_power: 5W
+    hysteresis: 10%
+```
 
 ### Grouping panels into HA sub-devices
 

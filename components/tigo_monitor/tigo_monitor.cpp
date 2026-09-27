@@ -534,6 +534,7 @@ void TigoMonitorComponent::update() {
   }
   mark_stale_devices_();
   publish_sensor_data();
+  evaluate_panel_alerts_();
 }
 
 void TigoMonitorComponent::add_panel_binding(const char *key) {
@@ -2758,6 +2759,89 @@ void TigoMonitorComponent::reset_peak_power() {
 #else
   ESP_LOGI(TAG, "Reset %d peak power values", reset_count);
 #endif
+}
+
+// ========== Per-panel alerts ==========
+
+void TigoMonitorComponent::evaluate_panel_alerts_() {
+  using panel_alerts::Reason;
+  if (alert_keys_.empty()) return;
+
+  if (in_night_mode_) {
+    // Every panel is legitimately silent at night; a truthful "stale" on all
+    // of them would be nightly alert noise (same rule as the counts, #24).
+    for (const auto &key : alert_keys_) publish_panel_alert_(key, Reason::OK);
+    return;
+  }
+
+  // Scratch buffers are sized once and reused: no allocation per poll.
+  if (alert_scratch_.capacity() < (size_t) number_of_devices_) alert_scratch_.reserve(number_of_devices_);
+  alert_string_median_.resize(strings_.size());
+
+  // Median power of each string (update_string_data() refreshed the groups
+  // this poll), and of all panels for the ones no string claims.
+  bool site_active = false;
+  size_t si = 0;
+  for (const auto &pair : strings_) {
+    alert_scratch_.clear();
+    for (const auto &addr : pair.second.device_addrs) {
+      const DeviceData *d = find_device_by_addr(addr);
+      if (d != nullptr && !d->is_stale) alert_scratch_.push_back(d->power_in);
+    }
+    float med = panel_alerts::median_above_floor(alert_scratch_.data(), alert_scratch_.size());
+    alert_string_median_[si++] = med;
+    if (med >= alert_thresholds_.min_string_w) site_active = true;
+  }
+  alert_scratch_.clear();
+  for (const auto &d : devices_)
+    if (!d.is_stale) alert_scratch_.push_back(d.power_in);
+  float site_median = panel_alerts::median_above_floor(alert_scratch_.data(), alert_scratch_.size());
+  if (strings_.empty() && site_median >= alert_thresholds_.min_string_w) site_active = true;
+
+  // A bound panel with no runtime row is dead or removed - but right after
+  // boot it may simply not have reported yet, so allow one stale_timeout first.
+  unsigned long grace = stale_timeout_ > 0 ? stale_timeout_ : 600000UL;
+  bool past_grace = millis() > grace;
+
+  for (const auto &node : node_table_) {
+    const node_string &key = binding_key_(node.addr);
+    if (key.empty() || alert_keys_.count(key) == 0) continue;  // unbound, or held after a renumbering
+
+    const DeviceData *d = find_device_by_addr(node.addr);
+    if (d == nullptr && !past_grace) continue;  // not reported yet, still in the boot grace period
+    bool stale = (d == nullptr) || d->is_stale;
+
+    float median = site_median;
+    if (!node.cca_string_label.empty()) {
+      auto it = strings_.find(node.cca_string_label);
+      if (it != strings_.end()) median = alert_string_median_[std::distance(strings_.begin(), it)];
+    }
+
+    auto prev_it = alert_state_.find(key);
+    Reason prev = prev_it != alert_state_.end() ? static_cast<Reason>(prev_it->second) : Reason::OK;
+    Reason r = panel_alerts::evaluate(stale, d != nullptr ? d->power_in : 0.0f, median, site_active, prev,
+                                      alert_thresholds_);
+    publish_panel_alert_(key, r);
+  }
+}
+
+void TigoMonitorComponent::publish_panel_alert_(const node_string &key, panel_alerts::Reason reason) {
+  // Only on change (and once at first evaluation): the state is sticky in HA,
+  // and republishing identical values every poll is just API traffic.
+  auto it = alert_state_.find(key);
+  if (it != alert_state_.end() && it->second == static_cast<uint8_t>(reason)) return;
+  if (it == alert_state_.end()) {
+    alert_state_[key] = static_cast<uint8_t>(reason);
+  } else {
+    it->second = static_cast<uint8_t>(reason);
+  }
+  auto b = alert_sensors_.find(key);
+  if (b != alert_sensors_.end()) b->second->publish_state(reason != panel_alerts::Reason::OK);
+  auto t = alert_reason_sensors_.find(key);
+  if (t != alert_reason_sensors_.end()) t->second->publish_state(panel_alerts::reason_str(reason));
+  if (reason != panel_alerts::Reason::OK) {
+    ESP_LOGI(TAG, "Panel %s alert: %s", key.c_str(), panel_alerts::reason_str(reason));
+  }
 }
 
 // ========== Per-panel energy ==========

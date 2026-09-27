@@ -110,6 +110,32 @@ These use the current (2026) Home Assistant automation schema: `triggers:`, `con
 
 > **Replace `notify.mobile_app_your_phone`** with your own device's notify service. Home Assistant creates one per companion-app device — for example `notify.mobile_app_pixel_8` or `notify.mobile_app_iphone`. Find yours under **Developer Tools → Actions**. Plain `notify.mobile_app` is not a valid target.
 
+### Panel Needs Attention
+
+Uses the per-panel `alert` and `alert_reason` sensors (see
+[Per-panel alerts](/esphome-tigomonitor/guides/configuration/#per-panel-alerts)).
+List one `alert` entity per panel:
+
+```yaml
+automation:
+  - alias: "Solar Panel Alert"
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.panel_1_alert
+          - binary_sensor.panel_2_alert
+        to: "on"
+        for:
+          minutes: 15
+    actions:
+      - action: notify.mobile_app_your_phone
+        data:
+          title: "Solar panel needs attention"
+          message: >-
+            {{ trigger.to_state.name }}:
+            {{ states(trigger.entity_id | replace('binary_sensor.', 'sensor.') ~ '_reason') }}
+```
+
 ### Low Efficiency Alert
 
 ```yaml

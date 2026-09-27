@@ -5,7 +5,7 @@ import re
 import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
-from esphome.components import sensor, text_sensor
+from esphome.components import binary_sensor, sensor, text_sensor
 from esphome.const import (
     CONF_ID,
     CONF_ADDRESS,
@@ -18,6 +18,7 @@ from esphome.const import (
     DEVICE_CLASS_TEMPERATURE,
     DEVICE_CLASS_SIGNAL_STRENGTH,
     DEVICE_CLASS_ENERGY,
+    DEVICE_CLASS_PROBLEM,
     STATE_CLASS_MEASUREMENT,
     STATE_CLASS_TOTAL_INCREASING,
     UNIT_WATT,
@@ -68,6 +69,11 @@ CONF_ENERGY_WEEK = "energy_week"
 CONF_ENERGY_MONTH = "energy_month"
 CONF_ENERGY_YEAR = "energy_year"
 _ENERGY_PERIOD_KEYS = (CONF_ENERGY_TODAY, CONF_ENERGY_WEEK, CONF_ENERGY_MONTH, CONF_ENERGY_YEAR)
+# Per-panel alert (binary, device_class problem) and its reason (text)
+CONF_ALERT = "alert"
+CONF_ALERT_REASON = "alert_reason"
+_TEXT_SUB_KEYS = ("barcode", "firmware_version", "device_info", CONF_ALERT_REASON)
+_BINARY_SUB_KEYS = (CONF_ALERT,)
 # Memory monitoring (ESP32 only)
 CONF_INTERNAL_RAM_FREE = "internal_ram_free"
 CONF_INTERNAL_RAM_MIN = "internal_ram_min"
@@ -187,6 +193,15 @@ def _tigo_text_sensor_schema(**kwargs):
     schema_dict[cv.Optional(CONF_NAME)] = cv.string
     return cv.Schema(schema_dict)
 
+def _tigo_binary_sensor_schema(**kwargs):
+    """Create a binary sensor schema that allows empty configs for auto-templating"""
+    base_schema = binary_sensor.binary_sensor_schema(**kwargs)
+    schema_dict = base_schema.schema.copy()
+    schema_dict[cv.Optional(CONF_ID)] = cv.declare_id(binary_sensor.BinarySensor)
+    schema_dict[cv.Optional(CONF_NAME)] = cv.string
+    return cv.Schema(schema_dict)
+
+
 def _auto_template_sensor_config(config):
     """Auto-template sensor configs with name and id if not provided"""
     base_name = config[CONF_NAME]
@@ -216,6 +231,8 @@ def _auto_template_sensor_config(config):
         (CONF_ENERGY_WEEK, "Energy Week"),
         (CONF_ENERGY_MONTH, "Energy Month"),
         (CONF_ENERGY_YEAR, "Energy Year"),
+        (CONF_ALERT, "Alert"),
+        (CONF_ALERT_REASON, "Alert Reason"),
     ]
 
     for conf_key, suffix in sensor_configs:
@@ -239,8 +256,10 @@ def _auto_template_sensor_config(config):
                     id_string = f"{base_id}_{suffix_id}"
 
                 # Use appropriate sensor type for ID declaration
-                if conf_key in [CONF_BARCODE, CONF_FIRMWARE_VERSION, CONF_DEVICE_INFO]:
+                if conf_key in _TEXT_SUB_KEYS:
                     sensor_config[CONF_ID] = cv.declare_id(text_sensor.TextSensor)(id_string)
+                elif conf_key in _BINARY_SUB_KEYS:
+                    sensor_config[CONF_ID] = cv.declare_id(binary_sensor.BinarySensor)(id_string)
                 else:
                     sensor_config[CONF_ID] = cv.declare_id(sensor.Sensor)(id_string)
 
@@ -252,7 +271,7 @@ def _auto_template_sensor_config(config):
                 sensor_config[CONF_DEVICE_ID] = parent_device_id
 
             # Add default fields for text sensors (skip None values to avoid C++ generation issues)
-            if conf_key in [CONF_BARCODE, CONF_FIRMWARE_VERSION, CONF_DEVICE_INFO]:
+            if conf_key in _TEXT_SUB_KEYS or conf_key in _BINARY_SUB_KEYS:
                 if "disabled_by_default" not in sensor_config:
                     sensor_config["disabled_by_default"] = False
 
@@ -268,6 +287,7 @@ _DEVICE_SUB_SENSOR_KEYS = (
     CONF_BARCODE, CONF_FIRMWARE_VERSION, CONF_DEVICE_INFO,
     CONF_EFFICIENCY, CONF_POWER_FACTOR, CONF_LOAD_FACTOR,
     CONF_ENERGY, *_ENERGY_PERIOD_KEYS,
+    CONF_ALERT, CONF_ALERT_REASON,
 )
 
 
@@ -401,6 +421,8 @@ DEVICE_CONFIG_SCHEMA = cv.All(
         cv.Optional(CONF_ENERGY_WEEK): _panel_energy_schema(),
         cv.Optional(CONF_ENERGY_MONTH): _panel_energy_schema(),
         cv.Optional(CONF_ENERGY_YEAR): _panel_energy_schema(),
+        cv.Optional(CONF_ALERT): _tigo_binary_sensor_schema(device_class=DEVICE_CLASS_PROBLEM),
+        cv.Optional(CONF_ALERT_REASON): _tigo_text_sensor_schema(icon="mdi:solar-panel"),
     }).extend(cv.COMPONENT_SCHEMA),
     _require_device_sub_sensor,
     _auto_template_sensor_config,
@@ -716,6 +738,8 @@ async def to_code(config):
         (CONF_ENERGY_WEEK, hub.add_panel_energy_week_sensor, sensor.new_sensor),
         (CONF_ENERGY_MONTH, hub.add_panel_energy_month_sensor, sensor.new_sensor),
         (CONF_ENERGY_YEAR, hub.add_panel_energy_year_sensor, sensor.new_sensor),
+        (CONF_ALERT, hub.add_alert_sensor, binary_sensor.new_binary_sensor),
+        (CONF_ALERT_REASON, hub.add_alert_reason_sensor, text_sensor.new_text_sensor),
     ]
     
     # Process each configured sensor type (auto-templating already done in validation)

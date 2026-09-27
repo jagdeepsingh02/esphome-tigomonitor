@@ -1,6 +1,30 @@
 # Home Assistant Automations for Tigo Monitor
 # Add these to your automations.yaml file or via the UI
 
+# Panel Alert (per-panel `alert:` / `alert_reason:` sub-keys)
+# Fires when a panel is stale, its string is down, or it is well below its
+# string's median. The reason text sensor says which.
+- alias: "Tigo - Panel Alert"
+  description: "Notify when a panel's alert has been on for 15 minutes"
+  trigger:
+    - platform: state
+      entity_id:
+        - binary_sensor.tigo_device_1_alert
+        - binary_sensor.tigo_device_2_alert
+        - binary_sensor.tigo_device_3_alert
+      to: "on"
+      for:
+        minutes: 15
+  action:
+    - service: notify.mobile_app_your_phone
+      data:
+        title: "⚠️ Solar Panel Alert"
+        message: >-
+          {{ trigger.to_state.name }}:
+          {{ states(trigger.entity_id | replace('binary_sensor.', 'sensor.') ~ '_reason') }}
+        data:
+          tag: "tigo_panel_alert"
+
 # Efficiency Drop Alert
 - alias: "Tigo - Low Efficiency Alert"
   description: "Alert when any panel efficiency drops below 90%"

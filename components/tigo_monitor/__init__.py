@@ -40,6 +40,31 @@ CONF_NIGHT_MODE_TIMEOUT = 'night_mode_timeout'
 CONF_STALE_TIMEOUT = 'stale_timeout'
 CONF_HISTORY_INTERVAL = 'history_interval'
 CONF_WEEK_START = 'week_start'
+CONF_PANEL_ALERTS = 'panel_alerts'
+CONF_LOW_THRESHOLD = 'low_threshold'
+CONF_UNDERPERFORM_THRESHOLD = 'underperform_threshold'
+CONF_MIN_STRING_POWER = 'min_string_power'
+CONF_HYSTERESIS = 'hysteresis'
+
+_power = cv.float_with_unit("power", "(W|w)?", optional_unit=True)
+
+
+def _validate_panel_alerts(config):
+    if config[CONF_LOW_THRESHOLD] >= config[CONF_UNDERPERFORM_THRESHOLD]:
+        raise cv.Invalid(
+            f"{CONF_LOW_THRESHOLD} must be below {CONF_UNDERPERFORM_THRESHOLD}: "
+            "\"low\" is the more severe of the two bands.")
+    return config
+
+
+# Defaults are the web UI's Alerts thresholds (app.html renderAlerts), so the
+# dashboard and Home Assistant flag the same panels.
+PANEL_ALERTS_SCHEMA = cv.All(cv.Schema({
+    cv.Optional(CONF_LOW_THRESHOLD, default="30%"): cv.percentage,
+    cv.Optional(CONF_UNDERPERFORM_THRESHOLD, default="60%"): cv.percentage,
+    cv.Optional(CONF_MIN_STRING_POWER, default="5W"): cv.All(_power, cv.float_range(min=0)),
+    cv.Optional(CONF_HYSTERESIS, default="10%"): cv.percentage,
+}), _validate_panel_alerts)
 
 # Inverter configuration schema
 INVERTER_SCHEMA = cv.Schema({
@@ -90,6 +115,8 @@ CONFIG_SCHEMA = cv.All(cv.Schema({
     cv.Optional(CONF_HISTORY_INTERVAL, default=30): cv.int_range(min=5, max=1440),
     # First day of the week for the per-panel `energy_week` sensors.
     cv.Optional(CONF_WEEK_START, default='monday'): cv.one_of('monday', 'sunday', lower=True),
+    # Thresholds for the per-panel `alert` / `alert_reason` sensors.
+    cv.Optional(CONF_PANEL_ALERTS, default={}): PANEL_ALERTS_SCHEMA,
 }).extend(cv.polling_component_schema('30s')).extend(uart.UART_DEVICE_SCHEMA), _warn_history_wear)
 
 # The Tigo bus is 38400 8N1, full stop. This used to be check_uart_settings()
@@ -139,6 +166,11 @@ def to_code(config):
     cg.add(var.set_stale_timeout(config[CONF_STALE_TIMEOUT] * 60000))
 
     cg.add(var.set_week_starts_monday(config[CONF_WEEK_START] == 'monday'))
+
+    alerts = config[CONF_PANEL_ALERTS]
+    cg.add(var.set_panel_alert_thresholds(
+        alerts[CONF_LOW_THRESHOLD], alerts[CONF_UNDERPERFORM_THRESHOLD],
+        alerts[CONF_MIN_STRING_POWER], alerts[CONF_HYSTERESIS]))
     
     # Configure inverters if provided
     if CONF_INVERTERS in config:

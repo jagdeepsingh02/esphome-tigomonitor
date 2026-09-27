@@ -25,6 +25,7 @@
 #include "tigo_history.h"
 #include "tigo_sensor_binding.h"
 #include "tigo_panel_energy.h"
+#include "tigo_panel_alerts.h"
 
 #ifdef USE_ESP_IDF
 #include <esp_heap_caps.h>
@@ -450,6 +451,17 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   void add_panel_energy_year_sensor(const char *address, sensor::Sensor *sensor) {
     this->add_panel_energy_sensor_(this->panel_energy_year_sensors_, address, sensor, "year");
   }
+  // Per-panel alert: problem binary sensor + reason text. See tigo_panel_alerts.h.
+  void add_alert_sensor(const char *address, binary_sensor::BinarySensor *sensor) {
+    this->alert_sensors_[address] = sensor;
+    this->alert_keys_.insert(node_string(address));
+    ESP_LOGCONFIG("tigo_monitor", "Registered alert sensor for address: %s", address);
+  }
+  void add_alert_reason_sensor(const char *address, text_sensor::TextSensor *sensor) {
+    this->alert_reason_sensors_[address] = sensor;
+    this->alert_keys_.insert(node_string(address));
+    ESP_LOGCONFIG("tigo_monitor", "Registered alert reason sensor for address: %s", address);
+  }
   void add_tigo_sensor(const char *address, sensor::Sensor *sensor) {
     this->power_in_sensors_[address] = sensor;
   }
@@ -597,6 +609,13 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   void set_night_mode_timeout(unsigned long timeout_ms) { this->night_mode_timeout_ = timeout_ms; }
   void set_stale_timeout(unsigned long timeout_ms) { this->stale_timeout_ = timeout_ms; }
   void set_week_starts_monday(bool monday) { this->week_starts_monday_ = monday; }
+  // `panel_alerts:` - fractions of the string median (0..1), watts, fraction.
+  void set_panel_alert_thresholds(float low, float underperform, float min_string_w, float hysteresis) {
+    this->alert_thresholds_.low = low;
+    this->alert_thresholds_.underperform = underperform;
+    this->alert_thresholds_.min_string_w = min_string_w;
+    this->alert_thresholds_.hysteresis = hysteresis;
+  }
   
 #ifdef USE_TIME
   void set_time_id(time::RealTimeClock *time_id) { this->time_id_ = time_id; }
@@ -715,6 +734,10 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   void roll_panel_energy_periods_();
   void publish_panel_energy_();
   void save_panel_energy_();
+
+  // Per-panel alerts, evaluated each poll after the string aggregates.
+  void evaluate_panel_alerts_();
+  void publish_panel_alert_(const node_string &key, panel_alerts::Reason reason);
 
   // Per-panel sensor binding (#74). binding_key_() maps a short address to the
   // key its sensors are registered under; see tigo_sensor_binding.h for the
@@ -872,6 +895,14 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   psram_map<node_string, sensor::Sensor*> panel_energy_year_sensors_;
   psram_set<node_string> panel_energy_keys_;                    // binding keys with any energy sensor
   psram_map<node_string, panel_energy::State> panel_energy_;    // key = full long address
+
+  // Per-panel alerts
+  psram_map<node_string, binary_sensor::BinarySensor*> alert_sensors_;
+  psram_map<node_string, text_sensor::TextSensor*> alert_reason_sensors_;
+  psram_set<node_string> alert_keys_;                  // binding keys with any alert sensor
+  psram_map<node_string, uint8_t> alert_state_;        // key -> last published Reason
+  psram_vector<float> alert_scratch_;                  // median work buffer, reused
+  psram_vector<float> alert_string_median_;            // per strings_ entry, in map order
 #else
   // Fallback to standard containers on Arduino
   std::vector<DeviceData> devices_;
@@ -907,7 +938,15 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   std::map<node_string, sensor::Sensor*> panel_energy_year_sensors_;
   std::set<node_string> panel_energy_keys_;
   std::map<node_string, panel_energy::State> panel_energy_;
+
+  std::map<node_string, binary_sensor::BinarySensor*> alert_sensors_;
+  std::map<node_string, text_sensor::TextSensor*> alert_reason_sensors_;
+  std::set<node_string> alert_keys_;
+  std::map<node_string, uint8_t> alert_state_;
+  std::vector<float> alert_scratch_;
+  std::vector<float> alert_string_median_;
 #endif
+  panel_alerts::Thresholds alert_thresholds_;
   bool week_starts_monday_ = true;
   uint32_t last_panel_energy_save_ms_ = 0;
   bool binding_dirty_ = true;
