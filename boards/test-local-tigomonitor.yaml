@@ -65,6 +65,25 @@ sensor:
   - platform: tigo_monitor
     tigo_monitor_id: tigo_hub
     name: "Zero Production Count"
+  # Per-panel entries, one per address form (#74): legacy short address,
+  # full barcode, and the web UI node table's truncated barcode
+  - platform: tigo_monitor
+    tigo_monitor_id: tigo_hub
+    address: "0004"
+    name: "Panel Short"
+    power: {}
+    peak_power: {}
+  - platform: tigo_monitor
+    tigo_monitor_id: tigo_hub
+    address: "BC0000000000000A"
+    name: "Panel Barcode"
+    power: {}
+    barcode: {}
+  - platform: tigo_monitor
+    tigo_monitor_id: tigo_hub
+    address: "…0000000B"
+    name: "Panel Tail"
+    power: {}
   # Die-temp source wired into tigo_server via internal_temperature_id (#28)
   - platform: internal_temperature
     id: esp32_die_temp

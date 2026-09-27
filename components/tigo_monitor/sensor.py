@@ -1,8 +1,10 @@
 """Sensor platform for Tigo Monitor devices."""
+import logging
 import re
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
+import esphome.final_validate as fv
 from esphome.components import sensor, text_sensor
 from esphome.const import (
     CONF_ID,
@@ -28,6 +30,8 @@ from esphome.const import (
 from . import tigo_monitor_ns, TigoMonitorComponent, CONF_TIGO_MONITOR_ID
 
 DEPENDENCIES = ['tigo_monitor']
+
+_LOGGER = logging.getLogger(__name__)
 
 # Define specific sensor configs
 CONF_POWER_IN = "power_in"
@@ -61,6 +65,78 @@ CONF_INTERNAL_RAM_FREE = "internal_ram_free"
 CONF_INTERNAL_RAM_MIN = "internal_ram_min"
 CONF_PSRAM_FREE = "psram_free"
 CONF_STACK_FREE = "stack_free"
+
+# --- Panel address: short address or barcode (#74) --------------------------
+# Mirrors components/tigo_monitor/tigo_sensor_binding.h — keep the two in step.
+_SHORT_ADDR_LEN = 4
+_BARCODE_MIN_LEN = 6   # a 4-char tail would be indistinguishable from a short address
+_BARCODE_MAX_LEN = 16
+_PLACEHOLDER_RE = re.compile(r"device_\d+")
+
+
+def _panel_address(value):
+    """Normalise a per-panel `address:`.
+
+    Accepts the 4-hex-char short address the gateway assigned (unchanged
+    behaviour), or the panel's barcode: its 16-hex-char long address, or the
+    last 6+ chars of it. Dashes, spaces and the web UI's leading "…" are
+    dropped and hex is upper-cased, so the node table's "…00899AA0" can be
+    pasted as-is. A barcode binding follows the physical panel when the
+    gateway renumbers short addresses; a short address does not.
+    """
+    raw = cv.string(value).strip()
+    if _PLACEHOLDER_RE.fullmatch(raw):
+        _LOGGER.warning(
+            "Panel address '%s' is a YAML-generator placeholder and will never "
+            "match a panel — replace it with the panel's barcode.", raw)
+        return raw
+    key = re.sub(r"[\s\-.\u2026]", "", raw).upper()
+    if not re.fullmatch(r"[0-9A-F]+", key or "-"):
+        raise cv.Invalid(
+            f"Panel address '{raw}' is not hex. Use the panel's barcode as shown "
+            "in the web UI node table (e.g. '04C05B4000899AA0' or '…00899AA0'), "
+            "or its 4-char short address (e.g. '0004').")
+    if len(key) == _SHORT_ADDR_LEN:
+        return key
+    if _BARCODE_MIN_LEN <= len(key) <= _BARCODE_MAX_LEN:
+        return key
+    raise cv.Invalid(
+        f"Panel address '{raw}' has {len(key)} hex digits. Use the full "
+        f"{_BARCODE_MAX_LEN}-digit barcode or at least its last "
+        f"{_BARCODE_MIN_LEN} digits (e.g. '899AA0'), or the {_SHORT_ADDR_LEN}-digit "
+        "short address. Four digits always mean a short address, which the "
+        "gateway can reassign.")
+
+
+def _is_barcode_key(key):
+    return (_BARCODE_MIN_LEN <= len(key) <= _BARCODE_MAX_LEN
+            and re.fullmatch(r"[0-9A-F]+", key) is not None)
+
+
+def _final_validate_barcode_tails(config):
+    """Reject barcode keys where one is a tail of another.
+
+    "899AA0" and "00899AA0" name the same panel (or a tail matches two
+    panels), and the firmware could only feed one of them. Entries repeating
+    the *same* key stay allowed: splitting one panel's sub-sensors across two
+    entries has always worked.
+    """
+    if CONF_ADDRESS not in config:
+        return config
+    mine = config[CONF_ADDRESS]
+    if not _is_barcode_key(mine):
+        return config
+    for entry in fv.full_config.get().get("sensor", []) or []:
+        other = entry.get(CONF_ADDRESS) if isinstance(entry, dict) else None
+        if entry.get("platform") != "tigo_monitor" or not other or other == mine:
+            continue
+        if _is_barcode_key(other) and (other.endswith(mine) or mine.endswith(other)):
+            raise cv.Invalid(
+                f"Panel addresses '{mine}' and '{other}' overlap: one is the end of "
+                "the other, so they can match the same panel. Use one entry per "
+                "panel, or give the full barcode.")
+    return config
+
 
 def _tigo_sensor_schema(**kwargs):
     """Create a sensor schema that allows empty configs for auto-templating"""
@@ -186,7 +262,7 @@ def _require_device_sub_sensor(config):
 DEVICE_CONFIG_SCHEMA = cv.All(
     cv.Schema({
         cv.GenerateID(CONF_TIGO_MONITOR_ID): cv.use_id(TigoMonitorComponent),
-        cv.Required(CONF_ADDRESS): cv.string,
+        cv.Required(CONF_ADDRESS): _panel_address,
         cv.Required(CONF_NAME): cv.string,
         # Optional sub-device assignment. Set once here and it propagates to
         # every selected sub-sensor below (power_in, peak_power, ...). The
@@ -520,6 +596,8 @@ def _validate_config(config):
 
 CONFIG_SCHEMA = _validate_config
 
+FINAL_VALIDATE_SCHEMA = _final_validate_barcode_tails
+
 async def to_code(config):
     hub = await cg.get_variable(config[CONF_TIGO_MONITOR_ID])
 
@@ -555,6 +633,7 @@ async def to_code(config):
     
     # This is a device sensor configuration
     address = config[CONF_ADDRESS]
+    cg.add(hub.add_panel_binding(address))
     
     # Define sensor configurations with their methods
     sensor_configs = [

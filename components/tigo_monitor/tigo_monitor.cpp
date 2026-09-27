@@ -5,6 +5,7 @@
 #include "esphome/core/application.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/network/util.h"
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <numeric>
@@ -523,9 +524,58 @@ void TigoMonitorComponent::loop() {
 void TigoMonitorComponent::update() {
   // This is called every polling interval
   StateLock lock(state_mutex_);
+  if (binding_dirty_) rebuild_bindings_();
   check_midnight_reset();
   mark_stale_devices_();
   publish_sensor_data();
+}
+
+void TigoMonitorComponent::add_panel_binding(const char *key) {
+  node_string k(key);
+  switch (sensor_binding::classify(k)) {
+    case sensor_binding::KeyKind::BARCODE:
+      if (std::find(barcode_keys_.begin(), barcode_keys_.end(), k) == barcode_keys_.end())
+        barcode_keys_.push_back(k);
+      break;
+    case sensor_binding::KeyKind::SHORT_ADDRESS:
+      short_keys_.insert(k);
+      break;
+    default:
+      break;  // YAML-generator placeholder (device_N): matches nothing, as before
+  }
+  binding_dirty_ = true;
+}
+
+const node_string &TigoMonitorComponent::binding_key_(const node_string &addr) {
+  if (binding_dirty_) rebuild_bindings_();
+  auto it = binding_for_addr_.find(addr);
+  // Not in the node table (yet): the short address itself, which is exactly
+  // the lookup every sensor used before barcode bindings existed.
+  return it != binding_for_addr_.end() ? it->second : addr;
+}
+
+void TigoMonitorComponent::rebuild_bindings_() {
+  binding_dirty_ = false;
+  if (barcode_keys_.empty()) {
+    // Address-only config: nothing to resolve, every lookup falls back to the
+    // short address. Keeps existing configs on the exact old code path.
+    binding_for_addr_.clear();
+    return;
+  }
+  static const node_string kHeld;
+  auto stats = sensor_binding::build(node_table_, barcode_keys_, short_keys_, renumbering_seen_,
+                                     kHeld, binding_for_addr_);
+  if (stats.ambiguous > 0)
+    ESP_LOGW(TAG, "%d panel(s) match more than one barcode sensor entry — using the first", stats.ambiguous);
+  if (stats.held != last_binding_held_) {
+    if (stats.held > 0) {
+      ESP_LOGW(TAG, "Gateway renumbered panels: holding %d barcode-bound panel(s) until their new "
+                    "address is confirmed (no data is published for them meanwhile)", stats.held);
+    } else {
+      ESP_LOGI(TAG, "All barcode-bound panels confirmed at their current addresses");
+    }
+    last_binding_held_ = stats.held;
+  }
 }
 
 void TigoMonitorComponent::mark_stale_devices_() {
@@ -558,6 +608,24 @@ void TigoMonitorComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Update interval: %lums", this->get_update_interval());
   ESP_LOGCONFIG(TAG, "  Max devices: %d", number_of_devices_);
   ESP_LOGCONFIG(TAG, "  Multi-sensor platform with manual configuration");
+  if (!barcode_keys_.empty()) {
+    // Resolve against the table restored from flash so the log says where
+    // each barcode-bound panel is right now (#74).
+    if (binding_dirty_) rebuild_bindings_();
+    ESP_LOGCONFIG(TAG, "  Panels bound by barcode: %zu", barcode_keys_.size());
+    for (const auto &key : barcode_keys_) {
+      const char *at = nullptr;
+      for (const auto &b : binding_for_addr_) {
+        if (b.second == key) { at = b.first.c_str(); break; }
+      }
+      if (at != nullptr) {
+        ESP_LOGCONFIG(TAG, "    %s -> short address %s", key.c_str(), at);
+      } else {
+        ESP_LOGW(TAG, "    %s -> not in the node table yet (waits for the gateway to announce it)",
+                 key.c_str());
+      }
+    }
+  }
   // A `time:` block in the YAML is not enough — it has to be wired in with
   // `time_id:`, or time_id_ stays null and every wall-clock feature (daily
   // energy totals, the midnight reset, on-flash history snapshots) silently
@@ -1122,7 +1190,21 @@ void TigoMonitorComponent::process_27_frame(const frame_string &hex_frame, size_
     if (res.renumbered) {
       ESP_LOGW(TAG, "Node %s now reports barcode %s — the gateway reassigned short addresses; "
                     "moving CCA labels with their panels", addr.c_str(), long_addr.c_str());
+      // The runtime row at this address holds the panel that left. Keep its
+      // peak under its own barcode and drop the row, so its last readings are
+      // never published as the arriving panel's; the next power frame from
+      // this address creates a fresh row for the new panel (#74).
+      for (auto dev_it = devices_.begin(); dev_it != devices_.end(); ++dev_it) {
+        if (dev_it->addr != addr) continue;
+        save_peak_(dev_it->addr, dev_it->barcode, dev_it->peak_power);
+        devices_.erase(dev_it);
+        break;
+      }
+      renumbering_seen_ = true;
     }
+    // Every entry can change a binding: a new pairing, or seen_in_frame27
+    // confirming one after a renumbering.
+    mark_bindings_dirty_();
     if (res.table_changed) table_changed = true;
     if (res.metadata_moved) dedup_merged = true;
 
@@ -1137,7 +1219,7 @@ void TigoMonitorComponent::process_27_frame(const frame_string &hex_frame, size_
       }
       
       // Always publish the barcode sensor when Frame 27 data arrives
-      auto barcode_it = barcode_sensors_.find(addr);
+      auto barcode_it = barcode_sensors_.find(binding_key_(addr));
       if (barcode_it != barcode_sensors_.end()) {
         barcode_it->second->publish_state(to_std_string(long_addr));
         ESP_LOGD(TAG, "Published Frame 27 long address for %s: %s", addr.c_str(), long_addr.c_str());
@@ -1199,11 +1281,8 @@ void TigoMonitorComponent::update_device_data(const DeviceData &data) {
     
     // Load saved peak power for this device
     DeviceData* new_device = &devices_.back();
-    std::string pref_key = "peak_" + to_std_string(data.addr);
-    uint32_t hash = esphome::fnv1_hash(pref_key);
-    auto load = this->cached_pref_<float>(hash);
-    float saved_peak = 0.0f;
-    if (load.load(&saved_peak) && saved_peak > 0.0f) {
+    float saved_peak = load_saved_peak_(data.addr, data.barcode);
+    if (saved_peak > 0.0f) {
       new_device->peak_power = saved_peak;
       ESP_LOGI(TAG, "Restored peak power for %s: %.0fW", data.addr.c_str(), saved_peak);
     }
@@ -1578,74 +1657,75 @@ void TigoMonitorComponent::publish_sensor_data() {
       
       // Publish zeros for all registered devices
       for (const auto &device : devices_) {
+        const node_string &key = binding_key_(device.addr);
         // Publish zero voltage input
-        auto voltage_in_it = voltage_in_sensors_.find(device.addr);
+        auto voltage_in_it = voltage_in_sensors_.find(key);
         if (voltage_in_it != voltage_in_sensors_.end()) {
           voltage_in_it->second->publish_state(0.0f);
         }
         
         // Publish zero voltage output
-        auto voltage_out_it = voltage_out_sensors_.find(device.addr);
+        auto voltage_out_it = voltage_out_sensors_.find(key);
         if (voltage_out_it != voltage_out_sensors_.end()) {
           voltage_out_it->second->publish_state(0.0f);
         }
         
         // Publish zero current
-        auto current_in_it = current_in_sensors_.find(device.addr);
+        auto current_in_it = current_in_sensors_.find(key);
         if (current_in_it != current_in_sensors_.end()) {
           current_in_it->second->publish_state(0.0f);
         }
         
         // Publish NaN temperature (unavailable in night mode)
-        auto temperature_it = temperature_sensors_.find(device.addr);
+        auto temperature_it = temperature_sensors_.find(key);
         if (temperature_it != temperature_sensors_.end()) {
           temperature_it->second->publish_state(NAN);
         }
         
         // Publish zero power
-        auto power_in_it = power_in_sensors_.find(device.addr);
+        auto power_in_it = power_in_sensors_.find(key);
         if (power_in_it != power_in_sensors_.end()) {
           power_in_it->second->publish_state(0.0f);
         }
 
         // Publish zero output current
-        auto current_out_it = current_out_sensors_.find(device.addr);
+        auto current_out_it = current_out_sensors_.find(key);
         if (current_out_it != current_out_sensors_.end()) {
           current_out_it->second->publish_state(0.0f);
         }
 
         // Publish zero output power
-        auto power_out_it = power_out_sensors_.find(device.addr);
+        auto power_out_it = power_out_sensors_.find(key);
         if (power_out_it != power_out_sensors_.end()) {
           power_out_it->second->publish_state(0.0f);
         }
         
         // Publish zero RSSI
-        auto rssi_it = rssi_sensors_.find(device.addr);
+        auto rssi_it = rssi_sensors_.find(key);
         if (rssi_it != rssi_sensors_.end()) {
           rssi_it->second->publish_state(0.0f);
         }
         
         // Publish zero duty cycle
-        auto duty_cycle_it = duty_cycle_sensors_.find(device.addr);
+        auto duty_cycle_it = duty_cycle_sensors_.find(key);
         if (duty_cycle_it != duty_cycle_sensors_.end()) {
           duty_cycle_it->second->publish_state(0.0f);
         }
         
         // Publish zero efficiency
-        auto efficiency_it = efficiency_sensors_.find(device.addr);
+        auto efficiency_it = efficiency_sensors_.find(key);
         if (efficiency_it != efficiency_sensors_.end()) {
           efficiency_it->second->publish_state(0.0f);
         }
         
         // Publish zero power factor
-        auto power_factor_it = power_factor_sensors_.find(device.addr);
+        auto power_factor_it = power_factor_sensors_.find(key);
         if (power_factor_it != power_factor_sensors_.end()) {
           power_factor_it->second->publish_state(0.0f);
         }
         
         // Publish zero load factor
-        auto load_factor_it = load_factor_sensors_.find(device.addr);
+        auto load_factor_it = load_factor_sensors_.find(key);
         if (load_factor_it != load_factor_sensors_.end()) {
           load_factor_it->second->publish_state(0.0f);
         }
@@ -1688,45 +1768,46 @@ void TigoMonitorComponent::publish_sensor_data() {
   
   for (size_t i = 0; i < devices_.size(); i++) {
     auto &device = devices_[i];
+    const node_string &key = binding_key_(device.addr);
     node_string device_id = device.barcode.empty() ? (node_string("mod#") + device.addr) : device.barcode;
     
     // Publish voltage input sensor
-    auto voltage_in_it = voltage_in_sensors_.find(device.addr);
+    auto voltage_in_it = voltage_in_sensors_.find(key);
     if (voltage_in_it != voltage_in_sensors_.end()) {
       voltage_in_it->second->publish_state(device.voltage_in);
       ESP_LOGD(TAG, "Published input voltage for %s: %.2fV", device.addr.c_str(), device.voltage_in);
     }
     
     // Publish voltage output sensor
-    auto voltage_out_it = voltage_out_sensors_.find(device.addr);
+    auto voltage_out_it = voltage_out_sensors_.find(key);
     if (voltage_out_it != voltage_out_sensors_.end()) {
       voltage_out_it->second->publish_state(device.voltage_out);
       ESP_LOGD(TAG, "Published output voltage for %s: %.2fV", device.addr.c_str(), device.voltage_out);
     }
     
     // Publish current sensor
-    auto current_in_it = current_in_sensors_.find(device.addr);
+    auto current_in_it = current_in_sensors_.find(key);
     if (current_in_it != current_in_sensors_.end()) {
       current_in_it->second->publish_state(device.current_in);
       ESP_LOGD(TAG, "Published current for %s: %.3fA", device.addr.c_str(), device.current_in);
     }
 
       // Publish output current sensor
-      auto current_out_it = current_out_sensors_.find(device.addr);
+      auto current_out_it = current_out_sensors_.find(key);
       if (current_out_it != current_out_sensors_.end()) {
         current_out_it->second->publish_state(device.current_out);
         ESP_LOGD(TAG, "Published output current for %s: %.3fA", device.addr.c_str(), device.current_out);
       }
     
     // Publish temperature sensor
-    auto temperature_it = temperature_sensors_.find(device.addr);
+    auto temperature_it = temperature_sensors_.find(key);
     if (temperature_it != temperature_sensors_.end()) {
       temperature_it->second->publish_state(device.temperature);
       ESP_LOGD(TAG, "Published temperature for %s: %.1f°C", device.addr.c_str(), device.temperature);
     }
     
     // Publish power sensor (calculated)
-    auto power_in_it = power_in_sensors_.find(device.addr);
+    auto power_in_it = power_in_sensors_.find(key);
     if (power_in_it != power_in_sensors_.end()) {
       power_in_it->second->publish_state(device.power_in);
       ESP_LOGD(TAG, "Published power_in for %s: %.0fW", device.addr.c_str(), device.power_in);
@@ -1739,35 +1820,35 @@ void TigoMonitorComponent::publish_sensor_data() {
     }
 
     // Publish output power sensor
-    auto power_out_it = power_out_sensors_.find(device.addr);
+    auto power_out_it = power_out_sensors_.find(key);
     if (power_out_it != power_out_sensors_.end()) {
       power_out_it->second->publish_state(device.power_out);
       ESP_LOGD(TAG, "Published output power for %s: %.0fW", device.addr.c_str(), device.power_out);
     }
     
     // Publish peak power sensor (always publish current peak)
-    auto peak_power_it = peak_power_sensors_.find(device.addr);
+    auto peak_power_it = peak_power_sensors_.find(key);
     if (peak_power_it != peak_power_sensors_.end()) {
       peak_power_it->second->publish_state(device.peak_power);
       ESP_LOGD(TAG, "Published peak power for %s: %.0fW", device.addr.c_str(), device.peak_power);
     }
     
     // Publish RSSI sensor
-    auto rssi_it = rssi_sensors_.find(device.addr);
+    auto rssi_it = rssi_sensors_.find(key);
     if (rssi_it != rssi_sensors_.end()) {
       rssi_it->second->publish_state(device.rssi);
       ESP_LOGD(TAG, "Published RSSI for %s: %ddBm", device.addr.c_str(), device.rssi);
     }
     
     // Publish barcode text sensor
-    auto barcode_it = barcode_sensors_.find(device.addr);
+    auto barcode_it = barcode_sensors_.find(key);
     if (barcode_it != barcode_sensors_.end()) {
       barcode_it->second->publish_state(to_std_string(device.barcode));
       ESP_LOGD(TAG, "Published barcode for %s: %s", device.addr.c_str(), device.barcode.c_str());
     }
 
     // Publish duty cycle sensor (normalize raw 0-255 byte to 0-100%)
-    auto duty_cycle_it = duty_cycle_sensors_.find(device.addr);
+    auto duty_cycle_it = duty_cycle_sensors_.find(key);
     if (duty_cycle_it != duty_cycle_sensors_.end()) {
       float duty_cycle_percent = (device.duty_cycle / 255.0f) * 100.0f;
       duty_cycle_it->second->publish_state(duty_cycle_percent);
@@ -1775,37 +1856,37 @@ void TigoMonitorComponent::publish_sensor_data() {
     }
 
     // Publish firmware version text sensor
-    auto firmware_version_it = firmware_version_sensors_.find(device.addr);
+    auto firmware_version_it = firmware_version_sensors_.find(key);
     if (firmware_version_it != firmware_version_sensors_.end()) {
       firmware_version_it->second->publish_state(to_std_string(device.firmware_version));
       ESP_LOGD(TAG, "Published firmware version for %s: %s", device.addr.c_str(), device.firmware_version.c_str());
     }
 
     // Publish efficiency sensor
-    auto efficiency_it = efficiency_sensors_.find(device.addr);
+    auto efficiency_it = efficiency_sensors_.find(key);
     if (efficiency_it != efficiency_sensors_.end()) {
       efficiency_it->second->publish_state(device.efficiency);
       ESP_LOGD(TAG, "Published efficiency for %s: %.2f%%", device.addr.c_str(), device.efficiency);
     }
 
     // Publish power factor sensor
-    auto power_factor_it = power_factor_sensors_.find(device.addr);
+    auto power_factor_it = power_factor_sensors_.find(key);
     if (power_factor_it != power_factor_sensors_.end()) {
       power_factor_it->second->publish_state(device.power_factor);
       ESP_LOGD(TAG, "Published power factor for %s: %.3f", device.addr.c_str(), device.power_factor);
     }
 
     // Publish load factor sensor
-    auto load_factor_it = load_factor_sensors_.find(device.addr);
+    auto load_factor_it = load_factor_sensors_.find(key);
     if (load_factor_it != load_factor_sensors_.end()) {
       load_factor_it->second->publish_state(device.load_factor);
       ESP_LOGD(TAG, "Published load factor for %s: %.3f", device.addr.c_str(), device.load_factor);
     }
     
     // Check if this device has a combined Tigo sensor
-    auto tigo_power_it = power_in_sensors_.find(device.addr);
+    auto tigo_power_it = power_in_sensors_.find(key);
     if (tigo_power_it != power_in_sensors_.end() && 
-        voltage_in_sensors_.find(device.addr) == voltage_in_sensors_.end()) {
+        voltage_in_sensors_.find(key) == voltage_in_sensors_.end()) {
       // This is a combined sensor (power sensor exists but individual sensors don't)
       float power_in = device.power_in;
       
@@ -2030,89 +2111,86 @@ void TigoMonitorComponent::publish_sensor_data() {
     // Skip if we already published data for this node
     if (has_runtime_data) continue;
     
+    const node_string &key = binding_key_(node.addr);
     // This node has a sensor but no runtime data - publish zeros with saved peak power
     ESP_LOGD(TAG, "Publishing saved data for node %s (no runtime data yet)", node.addr.c_str());
     
     // Try to load saved peak power for this node
-    std::string pref_key = "peak_" + to_std_string(node.addr);
-    uint32_t hash = esphome::fnv1_hash(pref_key);
-    auto load = this->cached_pref_<float>(hash);
-    float saved_peak = 0.0f;
-    load.load(&saved_peak);
+    float saved_peak = load_saved_peak_(node.addr, node.long_address);
     
     // Publish zeros for all sensors except peak power (which uses saved value)
-    auto voltage_in_it = voltage_in_sensors_.find(node.addr);
+    auto voltage_in_it = voltage_in_sensors_.find(key);
     if (voltage_in_it != voltage_in_sensors_.end()) {
       voltage_in_it->second->publish_state(0.0f);
     }
     
-    auto voltage_out_it = voltage_out_sensors_.find(node.addr);
+    auto voltage_out_it = voltage_out_sensors_.find(key);
     if (voltage_out_it != voltage_out_sensors_.end()) {
       voltage_out_it->second->publish_state(0.0f);
     }
     
-    auto current_in_it = current_in_sensors_.find(node.addr);
+    auto current_in_it = current_in_sensors_.find(key);
     if (current_in_it != current_in_sensors_.end()) {
       current_in_it->second->publish_state(0.0f);
     }
     
-    auto temperature_it = temperature_sensors_.find(node.addr);
+    auto temperature_it = temperature_sensors_.find(key);
     if (temperature_it != temperature_sensors_.end()) {
       temperature_it->second->publish_state(NAN);  // Use NAN for unavailable temperature
     }
     
-    auto power_in_it = power_in_sensors_.find(node.addr);
+    auto power_in_it = power_in_sensors_.find(key);
     if (power_in_it != power_in_sensors_.end()) {
       power_in_it->second->publish_state(0.0f);
     }
 
-    auto current_out_it = current_out_sensors_.find(node.addr);
+    auto current_out_it = current_out_sensors_.find(key);
     if (current_out_it != current_out_sensors_.end()) {
       current_out_it->second->publish_state(0.0f);
     }
 
-    auto power_out_it = power_out_sensors_.find(node.addr);
+    auto power_out_it = power_out_sensors_.find(key);
     if (power_out_it != power_out_sensors_.end()) {
       power_out_it->second->publish_state(0.0f);
     }
     
-    auto peak_power_it = peak_power_sensors_.find(node.addr);
+    auto peak_power_it = peak_power_sensors_.find(key);
     if (peak_power_it != peak_power_sensors_.end()) {
       peak_power_it->second->publish_state(saved_peak);  // Use saved peak power
       ESP_LOGD(TAG, "Published saved peak power for %s: %.0fW", node.addr.c_str(), saved_peak);
     }
     
-    auto rssi_it = rssi_sensors_.find(node.addr);
+    auto rssi_it = rssi_sensors_.find(key);
     if (rssi_it != rssi_sensors_.end()) {
       rssi_it->second->publish_state(0.0f);
     }
     
-    auto barcode_it = barcode_sensors_.find(node.addr);
+    auto barcode_it = barcode_sensors_.find(key);
     if (barcode_it != barcode_sensors_.end()) {
       barcode_it->second->publish_state(to_std_string(node.long_address));
     }
     
-    auto duty_cycle_it = duty_cycle_sensors_.find(node.addr);
+    auto duty_cycle_it = duty_cycle_sensors_.find(key);
     if (duty_cycle_it != duty_cycle_sensors_.end()) {
       duty_cycle_it->second->publish_state(0.0f);
     }
     
-    auto firmware_version_it = firmware_version_sensors_.find(node.addr);
+    auto firmware_version_it = firmware_version_sensors_.find(key);
     if (firmware_version_it != firmware_version_sensors_.end()) {
       firmware_version_it->second->publish_state("unknown");
     }
     
-    auto efficiency_it = efficiency_sensors_.find(node.addr);
+    auto efficiency_it = efficiency_sensors_.find(key);
     if (efficiency_it != efficiency_sensors_.end()) {
       efficiency_it->second->publish_state(0.0f);
     }
     
-    auto power_factor_it = power_factor_sensors_.find(node.addr);
+    auto power_factor_it = power_factor_sensors_.find(key);
     if (power_factor_it != power_factor_sensors_.end()) {
       power_factor_it->second->publish_state(0.0f);
     }
     
-    auto load_factor_it = load_factor_sensors_.find(node.addr);
+    auto load_factor_it = load_factor_sensors_.find(key);
     if (load_factor_it != load_factor_sensors_.end()) {
       load_factor_it->second->publish_state(0.0f);
     }
@@ -2290,7 +2368,16 @@ void TigoMonitorComponent::generate_sensor_yaml() {
       ESP_LOGI(TAG, "  # Tigo Device %s (discovered%s)", index_str.c_str(), barcode_comment.c_str());
       ESP_LOGI(TAG, "  - platform: tigo_monitor");
       ESP_LOGI(TAG, "    tigo_monitor_id: tigo_hub");
-      ESP_LOGI(TAG, "    address: \"%s\"", node.addr.c_str());
+      // The barcode keeps these entities on this panel if the gateway ever
+      // reassigns short addresses (#74); the short address is the fallback
+      // until a Frame 27 has told us the barcode.
+      if (!node.long_address.empty()) {
+        ESP_LOGI(TAG, "    address: \"%s\"  # barcode (short address now %s)",
+                 node.long_address.c_str(), node.addr.c_str());
+      } else {
+        ESP_LOGI(TAG, "    address: \"%s\"  # short address - replace with the barcode once known",
+                 node.addr.c_str());
+      }
       ESP_LOGI(TAG, "    name: \"Tigo Device %s\"", index_str.c_str());
       ESP_LOGI(TAG, "    power_in: {}");
       ESP_LOGI(TAG, "    voltage_in: {}");
@@ -2595,17 +2682,11 @@ void TigoMonitorComponent::save_peak_power_data() {
     return;
   }
   
-  // Use stack-allocated buffer instead of heap string to prevent memory leaks
-  char pref_key[32];
   int saved_count = 0;
   
   for (const auto &device : devices_) {
     if (device.peak_power > 0.0f) {
-      // Build key in stack buffer - no heap allocations
-      snprintf(pref_key, sizeof(pref_key), "peak_%s", device.addr.c_str());
-      uint32_t hash = esphome::fnv1_hash(pref_key);
-      auto save = this->cached_pref_<float>(hash);
-      save.save(&device.peak_power);
+      save_peak_(device.addr, device.barcode, device.peak_power);
       saved_count++;
     }
   }
@@ -2614,18 +2695,11 @@ void TigoMonitorComponent::save_peak_power_data() {
 }
 
 void TigoMonitorComponent::load_peak_power_data() {
-  // Use stack-allocated buffer instead of heap string to prevent memory leaks
-  char pref_key[32];
   int loaded_count = 0;
   
   for (auto &device : devices_) {
-    // Build key in stack buffer - no heap allocations
-    snprintf(pref_key, sizeof(pref_key), "peak_%s", device.addr.c_str());
-    uint32_t hash = esphome::fnv1_hash(pref_key);
-    auto load = this->cached_pref_<float>(hash);
-    
-    float saved_peak = 0.0f;
-    if (load.load(&saved_peak) && saved_peak > 0.0f) {
+    float saved_peak = load_saved_peak_(device.addr, device.barcode);
+    if (saved_peak > 0.0f) {
       device.peak_power = saved_peak;
       loaded_count++;
     }
@@ -2640,19 +2714,11 @@ void TigoMonitorComponent::reset_peak_power() {
   size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 #endif
 
-  // Use stack-allocated buffer instead of heap string to prevent memory leaks
-  char pref_key[32];
   int reset_count = 0;
-  float zero = 0.0f;
   
   for (auto &device : devices_) {
     device.peak_power = 0.0f;
-
-    // Build key in stack buffer - no heap allocations
-    snprintf(pref_key, sizeof(pref_key), "peak_%s", device.addr.c_str());
-    uint32_t hash = esphome::fnv1_hash(pref_key);
-    auto save = this->cached_pref_<float>(hash);
-    save.save(&zero);
+    save_peak_(device.addr, device.barcode, 0.0f);
     reset_count++;
   }
 
@@ -2675,6 +2741,35 @@ void TigoMonitorComponent::reset_peak_power() {
 #else
   ESP_LOGI(TAG, "Reset %d peak power values", reset_count);
 #endif
+}
+
+void TigoMonitorComponent::peak_pref_key_(const node_string &addr, const node_string &barcode,
+                                          char *buf, size_t len) {
+  // Stack buffer, no heap allocation. "pk_" + a 16-char long address fits 32.
+  if (barcode.size() >= sensor_binding::kBarcodeMinLen) {
+    snprintf(buf, len, "pk_%s", barcode.c_str());
+  } else {
+    snprintf(buf, len, "peak_%s", addr.c_str());
+  }
+}
+
+float TigoMonitorComponent::load_saved_peak_(const node_string &addr, const node_string &barcode) {
+  char pref_key[32];
+  float peak = 0.0f;
+  peak_pref_key_(addr, barcode, pref_key, sizeof(pref_key));
+  if (this->cached_pref_<float>(esphome::fnv1_hash(pref_key)).load(&peak)) return peak;
+  if (barcode.size() < sensor_binding::kBarcodeMinLen) return 0.0f;
+  // Nothing under the barcode yet: a peak saved by firmware that keyed it by
+  // short address. Read once; the next save moves it to the barcode key.
+  snprintf(pref_key, sizeof(pref_key), "peak_%s", addr.c_str());
+  if (this->cached_pref_<float>(esphome::fnv1_hash(pref_key)).load(&peak)) return peak;
+  return 0.0f;
+}
+
+void TigoMonitorComponent::save_peak_(const node_string &addr, const node_string &barcode, float peak) {
+  char pref_key[32];
+  peak_pref_key_(addr, barcode, pref_key, sizeof(pref_key));
+  this->cached_pref_<float>(esphome::fnv1_hash(pref_key)).save(&peak);
 }
 
 void TigoMonitorComponent::reset_total_energy() {
@@ -2823,6 +2918,7 @@ void TigoMonitorComponent::reset_node_table() {
   
   // Clear the in-memory node table
   node_table_.clear();
+  mark_bindings_dirty_();
   
   // Clear all persistent storage entries
   for (int i = 0; i < number_of_devices_; i++) {
@@ -2880,6 +2976,7 @@ bool TigoMonitorComponent::remove_node(uint16_t addr) {
   
   // Remove from node table
   node_table_.erase(it);
+  mark_bindings_dirty_();
   
   // Save updated node table to persistent storage
   save_node_table();
@@ -2907,6 +3004,7 @@ bool TigoMonitorComponent::import_node_table(const psram_vector<NodeTableData>& 
 
   // Clear existing node table
   node_table_.clear();
+  mark_bindings_dirty_();
   created_devices_.clear();
   parked_cca_.clear();
 
@@ -2949,9 +3047,12 @@ bool TigoMonitorComponent::import_node_table(const psram_vector<NodeTableData>& 
       ordered.push_back(node);
     }
   }
-  if (remapped || parked)
+  if (remapped || parked) {
     ESP_LOGW(TAG, "Import: backup predates a renumbering — %d entr%s moved to current addresses, %d held",
              remapped, remapped == 1 ? "y" : "ies", parked);
+    // The file's other pairings are just as old: trust only confirmed ones.
+    renumbering_seen_ = true;
+  }
 
   // Import all nodes
   for (const auto& node : ordered) {
@@ -3059,6 +3160,7 @@ void TigoMonitorComponent::assign_sensor_index_to_node(const node_string &addr) 
       new_node.sensor_index = -1;  // Will be assigned below
       new_node.is_persistent = true;
       node_table_.push_back(new_node);
+      mark_bindings_dirty_();
       node = &node_table_.back();  // Point to the newly added node
       ESP_LOGI(TAG, "Created new node entry for power data device: %s", addr.c_str());
     } else {

@@ -23,6 +23,7 @@
 #include <new>
 
 #include "tigo_history.h"
+#include "tigo_sensor_binding.h"
 
 #ifdef USE_ESP_IDF
 #include <esp_heap_caps.h>
@@ -314,6 +315,11 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   // Device name helper
   std::string get_device_name(const DeviceData &device);
   
+  // Declares one per-panel `sensor:` entry's `address:` — a 4-hex-char short
+  // address or a barcode (tail), already normalised by sensor.py. Every
+  // add_*_sensor() below is keyed by the same string. See tigo_sensor_binding.h.
+  void add_panel_binding(const char *key);
+
   // Manual sensor registration (for advanced users who want specific configurations)
   void add_voltage_in_sensor(const char *address, sensor::Sensor *sensor) { 
     this->voltage_in_sensors_[address] = sensor; 
@@ -669,6 +675,19 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   void save_node_table();
   void save_peak_power_data();
   void load_peak_power_data();
+  // Saved peak power is keyed by barcode when one is known, so it stays with
+  // the panel through a renumbering (#74); falls back to the legacy
+  // short-address key for panels saved by older firmware.
+  void peak_pref_key_(const node_string &addr, const node_string &barcode, char *buf, size_t len);
+  float load_saved_peak_(const node_string &addr, const node_string &barcode);
+  void save_peak_(const node_string &addr, const node_string &barcode, float peak);
+
+  // Per-panel sensor binding (#74). binding_key_() maps a short address to the
+  // key its sensors are registered under; see tigo_sensor_binding.h for the
+  // rules. The cache is rebuilt lazily after any node-table change.
+  const node_string &binding_key_(const node_string &addr);
+  void mark_bindings_dirty_() { binding_dirty_ = true; }
+  void rebuild_bindings_();
   void save_daily_energy_history();
   void load_daily_energy_history();
   void update_daily_energy(float energy_kwh);
@@ -805,6 +824,11 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   psram_map<node_string, sensor::Sensor*> power_factor_sensors_;
   psram_map<node_string, sensor::Sensor*> load_factor_sensors_;
   psram_map<node_string, sensor::Sensor*> string_power_sensors_;  // key = canonical string label
+
+  // Per-panel sensor binding (#74)
+  psram_vector<node_string> barcode_keys_;               // configured barcode (tail) keys
+  psram_set<node_string> short_keys_;                    // configured short-address keys
+  psram_map<node_string, node_string> binding_for_addr_;  // short address -> key ("" = held)
 #else
   // Fallback to standard containers on Arduino
   std::vector<DeviceData> devices_;
@@ -828,7 +852,17 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   std::map<node_string, sensor::Sensor*> power_factor_sensors_;
   std::map<node_string, sensor::Sensor*> load_factor_sensors_;
   std::map<node_string, sensor::Sensor*> string_power_sensors_;  // key = canonical string label
+
+  std::vector<node_string> barcode_keys_;
+  std::set<node_string> short_keys_;
+  std::map<node_string, node_string> binding_for_addr_;
 #endif
+  bool binding_dirty_ = true;
+  // Set by the first Frame 27 that reassigns a short address this session.
+  // From then on a barcode-bound panel publishes only once the gateway has
+  // re-confirmed its pairing (NodeTableData::seen_in_frame27).
+  bool renumbering_seen_ = false;
+  int last_binding_held_ = 0;
   sensor::Sensor* power_in_sum_sensor_ = nullptr;
   sensor::Sensor* power_out_sum_sensor_ = nullptr;
   sensor::Sensor* energy_in_sum_sensor_ = nullptr;
