@@ -13,6 +13,15 @@ external_components:
       type: local
       path: ../components
 
+# Clock for the per-panel energy periods (energy_today/week/month/year)
+time:
+  - platform: sntp
+    id: sntp_time
+
+tigo_monitor:
+  time_id: sntp_time
+  week_start: sunday
+
 # Exercises the internal_temperature_id codegen + read path (#28): deep-merges
 # into the board's tigo_server block so it reads this sensor instead of
 # installing its own temperature peripheral.
@@ -79,6 +88,11 @@ sensor:
     name: "Panel Barcode"
     power: {}
     barcode: {}
+    energy: {}
+    energy_today: {}
+    energy_week: {}
+    energy_month: {}
+    energy_year: {}
   - platform: tigo_monitor
     tigo_monitor_id: tigo_hub
     address: "…0000000B"

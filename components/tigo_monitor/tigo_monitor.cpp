@@ -526,6 +526,12 @@ void TigoMonitorComponent::update() {
   StateLock lock(state_mutex_);
   if (binding_dirty_) rebuild_bindings_();
   check_midnight_reset();
+  if (!panel_energy_keys_.empty()) {
+    // Runs in night mode too, so "today" returns to 0 at midnight even
+    // though the bus is silent.
+    roll_panel_energy_periods_();
+    if (millis() - last_panel_energy_save_ms_ >= 3600000UL) save_panel_energy_();
+  }
   mark_stale_devices_();
   publish_sensor_data();
 }
@@ -1323,6 +1329,11 @@ void TigoMonitorComponent::update_device_data(const DeviceData &data) {
   } else {
     ESP_LOGW(TAG, "Maximum number of devices reached (%d)", number_of_devices_);
   }
+
+  if (!panel_energy_keys_.empty()) {
+    DeviceData *updated = find_device_by_addr(data.addr);
+    if (updated != nullptr) accumulate_panel_energy_(*updated);
+  }
 }
 
 DeviceData* TigoMonitorComponent::find_device_by_addr(const node_string &addr) {
@@ -1647,6 +1658,7 @@ void TigoMonitorComponent::publish_sensor_data() {
     ESP_LOGI(TAG, "Night mode: Saving energy data to flash (in: %.3f kWh, out: %.3f kWh, baseline: %.3f kWh)", 
          total_energy_in_kwh_, total_energy_out_kwh_, energy_at_day_start_);
     save_energy_data();
+    save_panel_energy_();
   }
   
   // In night mode, publish zeros every 10 minutes
@@ -1752,6 +1764,9 @@ void TigoMonitorComponent::publish_sensor_data() {
       // truthful count would just be nightly alert noise (#24)
       if (stale_count_sensor_ != nullptr) stale_count_sensor_->publish_state(0);
       if (zero_production_count_sensor_ != nullptr) zero_production_count_sensor_->publish_state(0);
+
+      // Energy is held, not zeroed: what was produced today stays produced.
+      publish_panel_energy_();
       
       // Update cached values for display
       cached_total_power_in_ = 0.0f;
@@ -2196,6 +2211,8 @@ void TigoMonitorComponent::publish_sensor_data() {
     }
   }
   
+  publish_panel_energy_();
+
   // Update string-level aggregation data
   update_string_data();
   
@@ -2743,6 +2760,98 @@ void TigoMonitorComponent::reset_peak_power() {
 #endif
 }
 
+// ========== Per-panel energy ==========
+
+panel_energy::State *TigoMonitorComponent::panel_energy_state_(const node_string &barcode) {
+  if (barcode.size() < sensor_binding::kBarcodeMinLen) return nullptr;
+  panel_energy::State &st = panel_energy_[barcode];
+  if (!st.loaded) {
+    st.loaded = true;
+    char pref_key[32];  // "pe_" + 16-char long address
+    snprintf(pref_key, sizeof(pref_key), "pe_%s", barcode.c_str());
+    panel_energy::Record rec;
+    if (this->cached_pref_<panel_energy::Record>(esphome::fnv1_hash(pref_key)).load(&rec) &&
+        rec.version == panel_energy::Record::kVersion) {
+      st.rec = rec;
+      ESP_LOGI(TAG, "Restored energy for panel %s: %.3f kWh lifetime", barcode.c_str(), rec.lifetime_kwh);
+    }
+  }
+  return &st;
+}
+
+void TigoMonitorComponent::accumulate_panel_energy_(const DeviceData &device) {
+  // Only panels with an energy sensor get a record, so installs that don't
+  // use the feature pay nothing for it.
+  if (!has_panel_energy_(binding_key_(device.addr))) return;
+  panel_energy::State *st = panel_energy_state_(device.barcode);
+  if (st == nullptr) return;  // barcode not known yet — normally restored from the node table at boot
+  // A frame gap longer than this is a silent panel, not production to credit.
+  uint32_t max_gap = stale_timeout_ > 0 ? (uint32_t) stale_timeout_ : 300000UL;
+  // power_out already carries power_calibration_ (see process_power_frame).
+  panel_energy::integrate(*st, device.power_out, (uint32_t) device.last_update, max_gap);
+}
+
+void TigoMonitorComponent::roll_panel_energy_periods_() {
+#ifdef USE_TIME
+  if (time_id_ == nullptr) return;
+  auto now = time_id_->now();
+  if (!now.is_valid()) return;  // lifetime keeps counting; periods wait for a clock
+  panel_energy::Keys keys = panel_energy::keys_for(now.year, now.month, now.day_of_month, now.day_of_year,
+                                                   now.day_of_week, week_starts_monday_);
+  bool rolled = false;
+  for (auto &pair : panel_energy_) {
+    if (panel_energy::roll(pair.second, keys)) rolled = true;
+  }
+  if (rolled) {
+    ESP_LOGI(TAG, "Energy periods rolled over for %zu panel(s) (day %u)", panel_energy_.size(),
+             (unsigned) keys.key[panel_energy::DAY]);
+    publish_panel_energy_();
+    save_panel_energy_();
+  }
+#endif
+}
+
+void TigoMonitorComponent::publish_panel_energy_() {
+  if (panel_energy_keys_.empty()) return;
+  // Walk the node table rather than the runtime rows: a panel that has not
+  // reported since boot (a reboot at night) still gets its restored totals.
+  for (const auto &node : node_table_) {
+    const node_string &key = binding_key_(node.addr);
+    if (!has_panel_energy_(key)) continue;
+    panel_energy::State *st = panel_energy_state_(node.long_address);
+    if (st == nullptr) continue;
+    const panel_energy::Record &r = st->rec;
+    auto pub = [&key](auto &map, float value) {
+      auto it = map.find(key);
+      if (it != map.end()) it->second->publish_state(value);
+    };
+    pub(panel_energy_sensors_, r.lifetime_kwh);
+    // Periods need a clock to have started; until then they are unknown, not 0.
+    bool started = r.period_key[panel_energy::DAY] != 0;
+    pub(panel_energy_today_sensors_, started ? panel_energy::period_kwh(r, panel_energy::DAY) : NAN);
+    pub(panel_energy_week_sensors_, started ? panel_energy::period_kwh(r, panel_energy::WEEK) : NAN);
+    pub(panel_energy_month_sensors_, started ? panel_energy::period_kwh(r, panel_energy::MONTH) : NAN);
+    pub(panel_energy_year_sensors_, started ? panel_energy::period_kwh(r, panel_energy::YEAR) : NAN);
+  }
+}
+
+void TigoMonitorComponent::save_panel_energy_() {
+  last_panel_energy_save_ms_ = millis();
+  int saved = 0;
+  char pref_key[32];
+  for (auto &pair : panel_energy_) {
+    if (!pair.second.dirty) continue;
+    snprintf(pref_key, sizeof(pref_key), "pe_%s", pair.first.c_str());
+    if (this->cached_pref_<panel_energy::Record>(esphome::fnv1_hash(pref_key)).save(&pair.second.rec)) {
+      pair.second.dirty = false;
+      saved++;
+    }
+  }
+  if (saved > 0) {
+    ESP_LOGD(TAG, "Saved energy for %d panel(s)", saved);
+  }
+}
+
 void TigoMonitorComponent::peak_pref_key_(const node_string &addr, const node_string &barcode,
                                           char *buf, size_t len) {
   // Stack buffer, no heap allocation. "pk_" + a 16-char long address fits 32.
@@ -2907,6 +3016,7 @@ void TigoMonitorComponent::save_persistent_data() {
   save_peak_power_data();
   save_energy_data();
   save_daily_energy_history();
+  save_panel_energy_();
   ESP_LOGI(TAG, "All persistent data saved successfully");
 }
 

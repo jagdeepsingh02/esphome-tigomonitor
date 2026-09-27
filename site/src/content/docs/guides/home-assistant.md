@@ -42,6 +42,15 @@ sensor:
     name: "Total System Energy"  # Must include "energy" in the name
 ```
 
+### Per-panel production
+
+To see each panel's share, add `energy: {}` to its panel entry. The Energy
+Dashboard's **Solar Panels** section accepts several production sources and
+adds them up, so you can list every panel's `energy` sensor there *instead of*
+the system total — not alongside it, or production is counted twice. `energy_today`, `energy_week`, `energy_month` and `energy_year` give
+the calendar totals directly, for cards and automations. See
+[Per-panel energy](/esphome-tigomonitor/guides/configuration/#per-panel-energy).
+
 ---
 
 ## Ready-to-Use Dashboards

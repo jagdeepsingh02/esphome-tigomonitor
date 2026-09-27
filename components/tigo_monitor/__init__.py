@@ -39,6 +39,7 @@ CONF_POWER_CALIBRATION = 'power_calibration'
 CONF_NIGHT_MODE_TIMEOUT = 'night_mode_timeout'
 CONF_STALE_TIMEOUT = 'stale_timeout'
 CONF_HISTORY_INTERVAL = 'history_interval'
+CONF_WEEK_START = 'week_start'
 
 # Inverter configuration schema
 INVERTER_SCHEMA = cv.Schema({
@@ -87,6 +88,8 @@ CONFIG_SCHEMA = cv.All(cv.Schema({
     # then held the flash lock ~21 s, making 5 min a ~7% duty cycle); at ~0.65 s
     # it is now a retention guard — 5 min leaves only ~19 days of panel history.
     cv.Optional(CONF_HISTORY_INTERVAL, default=30): cv.int_range(min=5, max=1440),
+    # First day of the week for the per-panel `energy_week` sensors.
+    cv.Optional(CONF_WEEK_START, default='monday'): cv.one_of('monday', 'sunday', lower=True),
 }).extend(cv.polling_component_schema('30s')).extend(uart.UART_DEVICE_SCHEMA), _warn_history_wear)
 
 # The Tigo bus is 38400 8N1, full stop. This used to be check_uart_settings()
@@ -134,6 +137,8 @@ def to_code(config):
     
     # Per-device staleness cutoff (minutes -> ms; 0 disables)
     cg.add(var.set_stale_timeout(config[CONF_STALE_TIMEOUT] * 60000))
+
+    cg.add(var.set_week_starts_monday(config[CONF_WEEK_START] == 'monday'))
     
     # Configure inverters if provided
     if CONF_INVERTERS in config:

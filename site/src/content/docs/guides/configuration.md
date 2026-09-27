@@ -75,6 +75,7 @@ tigo_monitor:
 | `reset_at_midnight` | Boolean | false | Reset daily totals at midnight |
 | `power_calibration` | Float | 1.0 | Power multiplier (0.5-2.0) |
 | `night_mode_timeout` | Integer | 60 | Minutes before night mode (1-1440) |
+| `week_start` | `monday` / `sunday` | `monday` | First day of the week for per-panel `energy_week` sensors |
 | `stale_timeout` | Integer | 10 | Minutes without data before a device's production values (power, current, efficiency, duty cycle) zero out. `0` disables. Voltage/temperature keep their last reading for diagnostics |
 | `history_interval` | Integer | 30 | Minutes between on-flash history snapshots (5–1440). Lower means finer charts but proportionally more flash wear and shorter retention — see [Saving History to Flash](/esphome-tigomonitor/guides/tsdb-integration/). Values under 15 log a warning at build time |
 | `inverters` | List | None | Inverter grouping config |
@@ -365,6 +366,51 @@ mean a short address, which is why a barcode needs at least six.
 barcode, keep `name` exactly as it is, and reflash. Home Assistant identifies
 the entities by name, so they keep their history. The Tools view's YAML
 generator already emits barcodes.
+
+### Per-panel energy
+
+Five optional sub-keys report how much each panel has produced, in kWh:
+
+```yaml
+tigo_monitor:
+  time_id: sntp_time        # required for the four calendar periods
+  week_start: monday        # or sunday
+
+sensor:
+  - platform: tigo_monitor
+    address: "04C05B4000899AA0"
+    name: "Panel 1"
+    energy: {}          # lifetime — use this one in the Energy Dashboard
+    energy_today: {}    # since local midnight
+    energy_week: {}     # since the start of the week (week_start)
+    energy_month: {}    # since the 1st
+    energy_year: {}     # since 1 January
+```
+
+- Counted from the panel's **output** power (after the optimizer, with
+  `power_calibration` applied), sampled on every telemetry frame — so the
+  panels add up to what the string delivers to the inverter.
+- A panel that goes quiet for longer than `stale_timeout` (or 5 minutes if
+  that is `0`) gets nothing credited for the gap: no energy is ever invented
+  across an outage, a reboot or the night.
+- The totals are tied to the panel's barcode, saved on the device every hour,
+  at nightfall and on shutdown, and restored after a reboot — a crash loses at
+  most the last hour. They follow the panel through a gateway renumbering.
+- The period sensors return to 0 at the start of each period, even at night.
+  Home Assistant treats that as a meter reset, so long-term statistics stay
+  correct. Until the clock is synced after boot they read *unknown*.
+- `reset_at_midnight` and the web UI's energy reset don't touch these; they
+  only reset the system-wide totals.
+
+The four calendar sensors need a clock: `energy_today` and friends without a
+`time_id` is a config error rather than a sensor that never moves. Lifetime
+`energy` works without one.
+
+Each of these is a Home Assistant entity, with the internal-RAM cost that
+carries — see [Large installs](#large-installs--internal-ram). On a big array,
+enable only the periods you actually look at; Home Assistant's
+[utility meter](https://www.home-assistant.io/integrations/utility_meter/)
+can derive the others from lifetime `energy`.
 
 ### Grouping panels into HA sub-devices
 

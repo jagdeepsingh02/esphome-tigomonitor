@@ -11,6 +11,7 @@ from esphome.const import (
     CONF_ADDRESS,
     CONF_DEVICE_ID,
     CONF_NAME,
+    CONF_TIME_ID,
     DEVICE_CLASS_POWER,
     DEVICE_CLASS_VOLTAGE,
     DEVICE_CLASS_CURRENT,
@@ -60,6 +61,13 @@ CONF_POWER_FACTOR = "power_factor"
 CONF_LOAD_FACTOR = "load_factor"
 CONF_POWER_OUT = "power_out"
 CONF_STRING_LABEL = "string_label"  # Per-string aggregate sensor (keyed by CCA string label)
+# Per-panel energy (lifetime + calendar periods)
+CONF_ENERGY = "energy"
+CONF_ENERGY_TODAY = "energy_today"
+CONF_ENERGY_WEEK = "energy_week"
+CONF_ENERGY_MONTH = "energy_month"
+CONF_ENERGY_YEAR = "energy_year"
+_ENERGY_PERIOD_KEYS = (CONF_ENERGY_TODAY, CONF_ENERGY_WEEK, CONF_ENERGY_MONTH, CONF_ENERGY_YEAR)
 # Memory monitoring (ESP32 only)
 CONF_INTERNAL_RAM_FREE = "internal_ram_free"
 CONF_INTERNAL_RAM_MIN = "internal_ram_min"
@@ -111,6 +119,27 @@ def _panel_address(value):
 def _is_barcode_key(key):
     return (_BARCODE_MIN_LEN <= len(key) <= _BARCODE_MAX_LEN
             and re.fullmatch(r"[0-9A-F]+", key) is not None)
+
+
+def _final_validate_energy_clock(config):
+    """Calendar-period energy needs the hub's clock.
+
+    Without `time_id` there is no midnight, week or month to roll over at,
+    and the sensors would sit at "unknown" forever — the same silent no-op
+    #58 was about. Lifetime `energy` needs no clock and stays allowed.
+    """
+    periods = [k for k in _ENERGY_PERIOD_KEYS if k in config]
+    if not periods:
+        return config
+    hub = fv.full_config.get().get("tigo_monitor") or {}
+    if isinstance(hub, list):
+        hub = hub[0] if hub else {}
+    if CONF_TIME_ID not in hub:
+        raise cv.Invalid(
+            f"'{periods[0]}' on panel '{config.get(CONF_NAME)}' needs a clock: add "
+            "a `time:` block and point `time_id:` under `tigo_monitor:` at it. "
+            "(`energy:` — lifetime — works without one.)")
+    return config
 
 
 def _final_validate_barcode_tails(config):
@@ -182,6 +211,11 @@ def _auto_template_sensor_config(config):
         (CONF_EFFICIENCY, "Efficiency"),
         (CONF_POWER_FACTOR, "Power Factor"),
         (CONF_LOAD_FACTOR, "Load Factor"),
+        (CONF_ENERGY, "Energy"),
+        (CONF_ENERGY_TODAY, "Energy Today"),
+        (CONF_ENERGY_WEEK, "Energy Week"),
+        (CONF_ENERGY_MONTH, "Energy Month"),
+        (CONF_ENERGY_YEAR, "Energy Year"),
     ]
 
     for conf_key, suffix in sensor_configs:
@@ -233,7 +267,19 @@ _DEVICE_SUB_SENSOR_KEYS = (
     CONF_DUTY_CYCLE, CONF_TEMPERATURE, CONF_RSSI,
     CONF_BARCODE, CONF_FIRMWARE_VERSION, CONF_DEVICE_INFO,
     CONF_EFFICIENCY, CONF_POWER_FACTOR, CONF_LOAD_FACTOR,
+    CONF_ENERGY, *_ENERGY_PERIOD_KEYS,
 )
+
+
+def _panel_energy_schema():
+    # total_increasing for the period sensors too: HA reads their drop to 0
+    # at the start of a period as a meter reset, which is what it is.
+    return _tigo_sensor_schema(
+        unit_of_measurement=UNIT_KILOWATT_HOURS,
+        accuracy_decimals=3,
+        device_class=DEVICE_CLASS_ENERGY,
+        state_class=STATE_CLASS_TOTAL_INCREASING,
+    )
 
 
 def _require_device_sub_sensor(config):
@@ -350,6 +396,11 @@ DEVICE_CONFIG_SCHEMA = cv.All(
             accuracy_decimals=1,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
+        cv.Optional(CONF_ENERGY): _panel_energy_schema(),
+        cv.Optional(CONF_ENERGY_TODAY): _panel_energy_schema(),
+        cv.Optional(CONF_ENERGY_WEEK): _panel_energy_schema(),
+        cv.Optional(CONF_ENERGY_MONTH): _panel_energy_schema(),
+        cv.Optional(CONF_ENERGY_YEAR): _panel_energy_schema(),
     }).extend(cv.COMPONENT_SCHEMA),
     _require_device_sub_sensor,
     _auto_template_sensor_config,
@@ -596,7 +647,13 @@ def _validate_config(config):
 
 CONFIG_SCHEMA = _validate_config
 
-FINAL_VALIDATE_SCHEMA = _final_validate_barcode_tails
+def _final_validate(config):
+    _final_validate_barcode_tails(config)
+    _final_validate_energy_clock(config)
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate
 
 async def to_code(config):
     hub = await cg.get_variable(config[CONF_TIGO_MONITOR_ID])
@@ -654,6 +711,11 @@ async def to_code(config):
         (CONF_EFFICIENCY, hub.add_efficiency_sensor, sensor.new_sensor),
         (CONF_POWER_FACTOR, hub.add_power_factor_sensor, sensor.new_sensor),
         (CONF_LOAD_FACTOR, hub.add_load_factor_sensor, sensor.new_sensor),
+        (CONF_ENERGY, hub.add_panel_energy_sensor, sensor.new_sensor),
+        (CONF_ENERGY_TODAY, hub.add_panel_energy_today_sensor, sensor.new_sensor),
+        (CONF_ENERGY_WEEK, hub.add_panel_energy_week_sensor, sensor.new_sensor),
+        (CONF_ENERGY_MONTH, hub.add_panel_energy_month_sensor, sensor.new_sensor),
+        (CONF_ENERGY_YEAR, hub.add_panel_energy_year_sensor, sensor.new_sensor),
     ]
     
     # Process each configured sensor type (auto-templating already done in validation)

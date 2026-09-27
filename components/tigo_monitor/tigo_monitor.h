@@ -24,6 +24,7 @@
 
 #include "tigo_history.h"
 #include "tigo_sensor_binding.h"
+#include "tigo_panel_energy.h"
 
 #ifdef USE_ESP_IDF
 #include <esp_heap_caps.h>
@@ -432,6 +433,23 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
     this->load_factor_sensors_[address] = sensor; 
     ESP_LOGCONFIG("tigo_monitor", "Registered load_factor sensor for address: %s", address);
   }
+  // Per-panel energy (lifetime / today / week / month / year), keyed like
+  // every other per-panel sensor. See tigo_panel_energy.h.
+  void add_panel_energy_sensor(const char *address, sensor::Sensor *sensor) {
+    this->add_panel_energy_sensor_(this->panel_energy_sensors_, address, sensor, "lifetime");
+  }
+  void add_panel_energy_today_sensor(const char *address, sensor::Sensor *sensor) {
+    this->add_panel_energy_sensor_(this->panel_energy_today_sensors_, address, sensor, "today");
+  }
+  void add_panel_energy_week_sensor(const char *address, sensor::Sensor *sensor) {
+    this->add_panel_energy_sensor_(this->panel_energy_week_sensors_, address, sensor, "week");
+  }
+  void add_panel_energy_month_sensor(const char *address, sensor::Sensor *sensor) {
+    this->add_panel_energy_sensor_(this->panel_energy_month_sensors_, address, sensor, "month");
+  }
+  void add_panel_energy_year_sensor(const char *address, sensor::Sensor *sensor) {
+    this->add_panel_energy_sensor_(this->panel_energy_year_sensors_, address, sensor, "year");
+  }
   void add_tigo_sensor(const char *address, sensor::Sensor *sensor) {
     this->power_in_sensors_[address] = sensor;
   }
@@ -578,6 +596,7 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   void set_reset_at_midnight(bool reset) { this->reset_at_midnight_ = reset; }
   void set_night_mode_timeout(unsigned long timeout_ms) { this->night_mode_timeout_ = timeout_ms; }
   void set_stale_timeout(unsigned long timeout_ms) { this->stale_timeout_ = timeout_ms; }
+  void set_week_starts_monday(bool monday) { this->week_starts_monday_ = monday; }
   
 #ifdef USE_TIME
   void set_time_id(time::RealTimeClock *time_id) { this->time_id_ = time_id; }
@@ -681,6 +700,21 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   void peak_pref_key_(const node_string &addr, const node_string &barcode, char *buf, size_t len);
   float load_saved_peak_(const node_string &addr, const node_string &barcode);
   void save_peak_(const node_string &addr, const node_string &barcode, float peak);
+
+  // Per-panel energy. State is keyed by the panel's full long address so it
+  // follows the physical panel; sensors are found through binding_key_().
+  template<typename Map> void add_panel_energy_sensor_(Map &map, const char *address,
+                                                       sensor::Sensor *sensor, const char *what) {
+    map[address] = sensor;
+    this->panel_energy_keys_.insert(node_string(address));
+    ESP_LOGCONFIG("tigo_monitor", "Registered energy (%s) sensor for address: %s", what, address);
+  }
+  bool has_panel_energy_(const node_string &key) const { return panel_energy_keys_.count(key) > 0; }
+  panel_energy::State *panel_energy_state_(const node_string &barcode);
+  void accumulate_panel_energy_(const DeviceData &device);
+  void roll_panel_energy_periods_();
+  void publish_panel_energy_();
+  void save_panel_energy_();
 
   // Per-panel sensor binding (#74). binding_key_() maps a short address to the
   // key its sensors are registered under; see tigo_sensor_binding.h for the
@@ -829,6 +863,15 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   psram_vector<node_string> barcode_keys_;               // configured barcode (tail) keys
   psram_set<node_string> short_keys_;                    // configured short-address keys
   psram_map<node_string, node_string> binding_for_addr_;  // short address -> key ("" = held)
+
+  // Per-panel energy
+  psram_map<node_string, sensor::Sensor*> panel_energy_sensors_;
+  psram_map<node_string, sensor::Sensor*> panel_energy_today_sensors_;
+  psram_map<node_string, sensor::Sensor*> panel_energy_week_sensors_;
+  psram_map<node_string, sensor::Sensor*> panel_energy_month_sensors_;
+  psram_map<node_string, sensor::Sensor*> panel_energy_year_sensors_;
+  psram_set<node_string> panel_energy_keys_;                    // binding keys with any energy sensor
+  psram_map<node_string, panel_energy::State> panel_energy_;    // key = full long address
 #else
   // Fallback to standard containers on Arduino
   std::vector<DeviceData> devices_;
@@ -856,7 +899,17 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   std::vector<node_string> barcode_keys_;
   std::set<node_string> short_keys_;
   std::map<node_string, node_string> binding_for_addr_;
+
+  std::map<node_string, sensor::Sensor*> panel_energy_sensors_;
+  std::map<node_string, sensor::Sensor*> panel_energy_today_sensors_;
+  std::map<node_string, sensor::Sensor*> panel_energy_week_sensors_;
+  std::map<node_string, sensor::Sensor*> panel_energy_month_sensors_;
+  std::map<node_string, sensor::Sensor*> panel_energy_year_sensors_;
+  std::set<node_string> panel_energy_keys_;
+  std::map<node_string, panel_energy::State> panel_energy_;
 #endif
+  bool week_starts_monday_ = true;
+  uint32_t last_panel_energy_save_ms_ = 0;
   bool binding_dirty_ = true;
   // Set by the first Frame 27 that reassigns a short address this session.
   // From then on a barcode-bound panel publishes only once the gateway has
