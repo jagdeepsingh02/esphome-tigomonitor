@@ -313,13 +313,14 @@ Sensor type is inferred from name keywords:
 
 ### Individual Device Sensors
 
-Requires `address` from device discovery:
+Each panel entry names its panel with `address` — preferably the panel's
+**barcode**, as shown in the web UI's Nodes table:
 
 ```yaml
 sensor:
   - platform: tigo_monitor
     tigo_monitor_id: tigo_hub
-    address: "1234"
+    address: "04C05B4000899AA0"   # barcode — or "…00899AA0", or just "899AA0"
     name: "Panel 1"
     power: {}
     peak_power: {}
@@ -337,6 +338,33 @@ sensor:
 `address` and `name` only say *which* panel and what to call it — the entities
 come from the sub-keys, so list at least one. An entry with none creates no
 entities, and is rejected at validation time rather than silently skipped.
+
+#### Barcode or short address?
+
+`address` accepts either:
+
+| Form | Example | After the gateway renumbers panels |
+|---|---|---|
+| Barcode — all 16 digits, or at least the last 6 | `04C05B4000899AA0`, `…00899AA0`, `899AA0` | Entities stay on their panel |
+| Short address — exactly 4 digits | `0004` | Entities show whichever panel now has that address |
+
+The short address is handed out by the CCA/TAP at commissioning, and it can
+reassign all of them at once — a rediscovery is enough. When that happens, an
+entry bound by short address keeps publishing, but with another panel's
+numbers, and Home Assistant has no way to tell. Bind by barcode and this can't
+happen: the firmware follows each panel to its new address. Right after a
+renumbering, a barcode-bound panel publishes nothing for the few minutes
+until the gateway confirms where it went, rather than risk publishing the
+wrong panel.
+
+You can copy the barcode straight from the Nodes table, leading `…`
+included; dashes, spaces and letter case don't matter. Four digits always
+mean a short address, which is why a barcode needs at least six.
+
+**Switching an existing entry** — replace the 4-digit `address` with the
+barcode, keep `name` exactly as it is, and reflash. Home Assistant identifies
+the entities by name, so they keep their history. The Tools view's YAML
+generator already emits barcodes.
 
 ### Grouping panels into HA sub-devices
 

@@ -3298,9 +3298,18 @@ void TigoWebServer::build_yaml_json(PSRAMString& json, const std::set<std::strin
     yaml_text.append(")\n");
     yaml_text.append("  - platform: tigo_monitor\n");
     yaml_text.append("    tigo_monitor_id: tigo_hub\n");
+    // Bind by barcode when known, so the entities stay on this panel if the
+    // gateway reassigns short addresses (#74).
     yaml_text.append("    address: \"");
-    yaml_text.append(node.addr.c_str());
-    yaml_text.append("\"\n");
+    if (!node.long_address.empty()) {
+      yaml_text.append(node.long_address.c_str());
+      yaml_text.append("\"  # barcode (short address now ");
+      yaml_text.append(node.addr.c_str());
+      yaml_text.append(")\n");
+    } else {
+      yaml_text.append(node.addr.c_str());
+      yaml_text.append("\"  # short address - replace with the barcode once known\n");
+    }
     yaml_text.append("    name: \"");
     yaml_text.append(device_name.c_str());
     yaml_text.append("\"\n");
