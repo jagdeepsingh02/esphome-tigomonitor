@@ -2768,60 +2768,56 @@ void TigoMonitorComponent::evaluate_panel_alerts_() {
   if (alert_keys_.empty()) return;
 
   if (in_night_mode_) {
-    // Every panel is legitimately silent at night; a truthful "stale" on all
-    // of them would be nightly alert noise (same rule as the counts, #24).
+    // Every panel is legitimately silent at night (same rule as the counts, #24).
     for (const auto &key : alert_keys_) publish_panel_alert_(key, Reason::OK);
     return;
   }
 
-  // Scratch buffers are sized once and reused: no allocation per poll.
-  if (alert_scratch_.capacity() < (size_t) number_of_devices_) alert_scratch_.reserve(number_of_devices_);
-  alert_string_median_.resize(strings_.size());
-
-  // Median power of each string (update_string_data() refreshed the groups
-  // this poll), and of all panels for the ones no string claims.
-  bool site_active = false;
-  size_t si = 0;
-  for (const auto &pair : strings_) {
-    alert_scratch_.clear();
-    for (const auto &addr : pair.second.device_addrs) {
-      const DeviceData *d = find_device_by_addr(addr);
-      if (d != nullptr && !d->is_stale) alert_scratch_.push_back(d->power_in);
-    }
-    float med = panel_alerts::median_above_floor(alert_scratch_.data(), alert_scratch_.size());
-    alert_string_median_[si++] = med;
-    if (med >= alert_thresholds_.min_string_w) site_active = true;
+  // Every panel goes in, not just the ones with an alert sensor: they are all
+  // somebody's peers. Buffers are members, cleared rather than reallocated.
+  alert_panels_.clear();
+  alert_panel_keys_.clear();
+  if (alert_panels_.capacity() < node_table_.size()) {
+    alert_panels_.reserve(node_table_.size());
+    alert_panel_keys_.reserve(node_table_.size());
+    alert_scratch_.reserve(node_table_.size());
   }
-  alert_scratch_.clear();
-  for (const auto &d : devices_)
-    if (!d.is_stale) alert_scratch_.push_back(d.power_in);
-  float site_median = panel_alerts::median_above_floor(alert_scratch_.data(), alert_scratch_.size());
-  if (strings_.empty() && site_median >= alert_thresholds_.min_string_w) site_active = true;
 
-  // A bound panel with no runtime row is dead or removed - but right after
-  // boot it may simply not have reported yet, so allow one stale_timeout first.
+  // A panel with no runtime row is dead or removed — but right after boot it
+  // may simply not have reported yet, so it is left out for one stale_timeout.
   unsigned long grace = stale_timeout_ > 0 ? stale_timeout_ : 600000UL;
   bool past_grace = millis() > grace;
 
+  // Resolve bindings up front: alert_panel_keys_ keeps pointers into the
+  // binding cache, which a rebuild part-way through the loop would invalidate.
+  if (binding_dirty_) rebuild_bindings_();
   for (const auto &node : node_table_) {
-    const node_string &key = binding_key_(node.addr);
-    if (key.empty() || alert_keys_.count(key) == 0) continue;  // unbound, or held after a renumbering
-
     const DeviceData *d = find_device_by_addr(node.addr);
-    if (d == nullptr && !past_grace) continue;  // not reported yet, still in the boot grace period
-    bool stale = (d == nullptr) || d->is_stale;
+    if (d == nullptr && !past_grace) continue;
 
-    float median = site_median;
+    panel_alerts::Panel p;
+    p.silent = (d == nullptr) || d->is_stale;
+    p.power_w = (d != nullptr) ? d->power_in : 0.0f;
     if (!node.cca_string_label.empty()) {
       auto it = strings_.find(node.cca_string_label);
-      if (it != strings_.end()) median = alert_string_median_[std::distance(strings_.begin(), it)];
+      if (it != strings_.end()) p.group = (int) std::distance(strings_.begin(), it);
     }
 
-    auto prev_it = alert_state_.find(key);
-    Reason prev = prev_it != alert_state_.end() ? static_cast<Reason>(prev_it->second) : Reason::OK;
-    Reason r = panel_alerts::evaluate(stale, d != nullptr ? d->power_in : 0.0f, median, site_active, prev,
-                                      alert_thresholds_);
-    publish_panel_alert_(key, r);
+    // Unbound, or held after a renumbering (empty key): a peer only.
+    const node_string &key = binding_key_(node.addr);
+    const node_string *pub = (!key.empty() && alert_keys_.count(key) > 0) ? &key : nullptr;
+    if (pub != nullptr) {
+      auto prev_it = alert_state_.find(key);
+      if (prev_it != alert_state_.end()) p.prev = static_cast<Reason>(prev_it->second);
+    }
+    alert_panels_.push_back(p);
+    alert_panel_keys_.push_back(pub);
+  }
+
+  panel_alerts::evaluate_all(alert_panels_, strings_.size(), alert_stats_, alert_scratch_, alert_thresholds_);
+
+  for (size_t i = 0; i < alert_panels_.size(); ++i) {
+    if (alert_panel_keys_[i] != nullptr) publish_panel_alert_(*alert_panel_keys_[i], alert_panels_[i].out);
   }
 }
 

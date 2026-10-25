@@ -901,8 +901,11 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   psram_map<node_string, text_sensor::TextSensor*> alert_reason_sensors_;
   psram_set<node_string> alert_keys_;                  // binding keys with any alert sensor
   psram_map<node_string, uint8_t> alert_state_;        // key -> last published Reason
-  psram_vector<float> alert_scratch_;                  // median work buffer, reused
-  psram_vector<float> alert_string_median_;            // per strings_ entry, in map order
+  // Work buffers for evaluate_panel_alerts_(), reused every poll.
+  psram_vector<panel_alerts::Panel> alert_panels_;
+  psram_vector<const node_string *> alert_panel_keys_;  // parallel; nullptr = no alert sensor
+  psram_vector<panel_alerts::GroupStat> alert_stats_;
+  psram_vector<float> alert_scratch_;
 #else
   // Fallback to standard containers on Arduino
   std::vector<DeviceData> devices_;
@@ -943,8 +946,10 @@ class TigoMonitorComponent : public PollingComponent, public uart::UARTDevice {
   std::map<node_string, text_sensor::TextSensor*> alert_reason_sensors_;
   std::set<node_string> alert_keys_;
   std::map<node_string, uint8_t> alert_state_;
+  std::vector<panel_alerts::Panel> alert_panels_;
+  std::vector<const node_string *> alert_panel_keys_;
+  std::vector<panel_alerts::GroupStat> alert_stats_;
   std::vector<float> alert_scratch_;
-  std::vector<float> alert_string_median_;
 #endif
   panel_alerts::Thresholds alert_thresholds_;
   bool week_starts_monday_ = true;

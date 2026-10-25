@@ -428,22 +428,33 @@ sensor:
     alert_reason: {}    # text: ok | stale | string_down | low | underperforming
 ```
 
-The rules are the dashboard's **Alerts** list, so Home Assistant and the web
-UI agree on which panel is in trouble:
+Nothing about your roof needs configuring — orientation, panel count and
+wattage are all handled by comparing each panel with the panels it shares a
+string with:
 
 | Reason | When |
 |---|---|
-| `stale` | The panel has stopped reporting for longer than `stale_timeout` |
-| `string_down` | Its whole string produces nothing while the rest of the site does |
+| `stale` | Silent for longer than `stale_timeout` while the rest of its string is still reporting and producing |
+| `string_down` | Its whole string is flat (or silent) while another string makes at least 100 W per panel |
 | `low` | Below 30 % of its string's median output |
 | `underperforming` | Below 60 % of its string's median output |
 | `ok` | None of the above |
 
-- A panel is compared with the other panels on its **string** (panels without
-  a string label: with all panels), so dawn, dusk and cloud move the reference
-  with it instead of raising alerts. Panels under 5 W don't count toward the
-  median, and a string whose median is below `min_string_power` isn't compared
-  at all.
+- Panels on one roof face wake and sleep together, so an east, west, south or
+  north string going quiet at its own dawn or dusk isn't an alert. That is
+  also why these alerts can read `ok` while the web UI's Nodes view shows a
+  panel as stale: the UI marks every panel silent for 10 minutes, the alert
+  only one whose string-mates carry on.
+- `string_down` needs another string producing properly (100 W per panel). A
+  tripped string reads about 0 W, while a face turned away from the sun still
+  makes several watts from diffuse light by then. Panels too small to ever
+  reach 100 W simply never raise it.
+- A panel alone on its string, or without a string label, is compared with
+  all panels. Where there's nothing to compare with — a one-panel system, or
+  `low` on a one-panel string — the alert stays `ok`: a missed alert, never a
+  false one.
+- Panels under 5 W don't count toward a median, and a string whose median is
+  below `min_string_power` counts as flat.
 - Once flagged, a panel has to climb `hysteresis` above the threshold before
   it clears, so it doesn't flap on the line.
 - Everything reads `ok` in night mode.
@@ -457,7 +468,7 @@ tigo_monitor:
   panel_alerts:
     low_threshold: 30%
     underperform_threshold: 60%
-    min_string_power: 5W
+    min_string_power: 5W      # string median below this = flat
     hysteresis: 10%
 ```
 
